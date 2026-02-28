@@ -20,7 +20,7 @@
             parse: 'json'
         }
     ];
-    const RATE_LIMIT_MS = 2000;
+    const RATE_LIMIT_MS = 800;
 
     // ── State ─────────────────────────────────────────────────
     let lastRequestTime = 0;
@@ -69,7 +69,7 @@
 
     /**
      * Fetches a URL through a CORS proxy to bypass browser restrictions.
-     * Tries multiple proxies in sequence.
+     * Races ALL proxies in parallel — first successful response wins.
      */
     async function fetchViaCorsProxy(targetUrl) {
         const proxies = [
@@ -78,20 +78,21 @@
             (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`
         ];
 
-        for (const makeProxyUrl of proxies) {
-            try {
-                const proxyUrl = makeProxyUrl(targetUrl);
-                const response = await fetch(proxyUrl, {
-                    headers: { 'Accept': 'application/json, text/html, */*' }
-                });
-                if (response.ok) {
-                    return response;
-                }
-            } catch (e) {
-                console.warn(`CORS proxy failed for ${targetUrl}:`, e.message);
-            }
+        const attempts = proxies.map(makeProxyUrl => {
+            const proxyUrl = makeProxyUrl(targetUrl);
+            return fetch(proxyUrl, {
+                headers: { 'Accept': 'application/json, text/html, */*' }
+            }).then(r => {
+                if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                return r;
+            });
+        });
+
+        try {
+            return await Promise.any(attempts);
+        } catch {
+            throw new Error('All CORS proxies failed.');
         }
-        throw new Error('All CORS proxies failed.');
     }
 
     /**
@@ -145,13 +146,13 @@
      * Fetches tweet metadata using multiple strategies with fallbacks.
      * Strategy 1: Twitter Syndication API (via CORS proxy)
      * Strategy 2: fxtwitter.com open API (via CORS proxy)
-     * Strategy 3: Cobalt API
+     * All strategies race in parallel — fastest successful response wins.
      */
     async function fetchTweetMetadata(tweetUrl) {
         const validation = validateUrl(tweetUrl);
         if (!validation.valid) throw new Error(validation.error);
 
-        // Rate limiting
+        // Rate limiting (lightweight)
         const now = Date.now();
         const elapsed = now - lastRequestTime;
         if (elapsed < RATE_LIMIT_MS) {
@@ -160,160 +161,91 @@
         lastRequestTime = Date.now();
 
         const tweetId = validation.tweetId;
-        const errors = [];
 
-        // ── Strategy 1: Twitter Syndication API ─────────────────
-        // This is Twitter's own public endpoint used for embeds
-        try {
+        // ── Build parallel strategy promises ─────────────────────
+        // All three strategies launch simultaneously.
+        // Promise.any resolves as soon as ONE succeeds with video data.
+
+        const strategy1 = (async () => {
             const syndicationUrl = `https://cdn.syndication.twimg.com/tweet-result?id=${tweetId}&lang=en&token=0`;
             const response = await fetchViaCorsProxy(syndicationUrl);
-            const text = await response.text();
-
-            let data;
-            try {
-                data = JSON.parse(text);
-            } catch {
-                throw new Error('Invalid JSON from syndication API');
-            }
-
+            const data = JSON.parse(await response.text());
             const { videos, thumbnail } = parseSyndicationVideo(data);
-
-            if (videos.length > 0) {
-                return {
-                    tweetId,
-                    mediaType: data.mediaDetails?.[0]?.type === 'animated_gif' ? 'gif' : 'video',
-                    mediaUrls: videos,
-                    thumbnail,
-                    source: 'Twitter CDN'
-                };
-            }
-
-            // If we got data but no videos, check if it's a photo or text-only tweet
-            if (data.text && videos.length === 0) {
-                errors.push('This tweet does not contain a video or GIF.');
-            }
-        } catch (e) {
-            console.warn('Strategy 1 (Syndication) failed:', e.message);
-            errors.push(`Syndication: ${e.message}`);
-        }
-
-        // ── Strategy 2: fxtwitter / vxtwitter API ───────────────
-        // Open-source Twitter frontend that exposes tweet data as JSON
-        try {
-            const fxUrl = `https://api.fxtwitter.com/status/${tweetId}`;
-            const response = await fetchViaCorsProxy(fxUrl);
-            const text = await response.text();
-
-            let data;
-            try {
-                data = JSON.parse(text);
-            } catch {
-                throw new Error('Invalid JSON from fxtwitter');
-            }
-
-            const tweet = data.tweet || data;
-            const media = tweet.media;
-
-            if (media && media.videos && media.videos.length > 0) {
-                const videoList = [];
-                for (const v of media.videos) {
-                    if (v.url) {
-                        videoList.push({
-                            url: v.url,
-                            quality: v.height ? `${v.height}p` : 'best',
-                            bitrate: v.bitrate || 0
-                        });
-                    }
-                }
-                if (videoList.length > 0) {
-                    return {
-                        tweetId,
-                        mediaType: media.videos[0]?.type === 'gif' ? 'gif' : 'video',
-                        mediaUrls: videoList,
-                        thumbnail: media.videos[0]?.thumbnail_url || media.photos?.[0]?.url || null,
-                        source: 'fxtwitter'
-                    };
-                }
-            }
-
-            // Check for mosaic/photo-only
-            if (media && media.photos && media.photos.length > 0 && (!media.videos || media.videos.length === 0)) {
-                errors.push('This tweet contains images but no videos or GIFs.');
-            }
-        } catch (e) {
-            console.warn('Strategy 2 (fxtwitter) failed:', e.message);
-            errors.push(`fxtwitter: ${e.message}`);
-        }
-
-        // ── Strategy 3: Cobalt API ──────────────────────────────
-        try {
-            const response = await fetch('https://api.cobalt.tools/api/json', {
-                method: 'POST',
-                headers: {
-                    'Accept': 'application/json',
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    url: tweetUrl,
-                    vCodec: 'h264',
-                    vQuality: 'max',
-                    isNoTTWatermark: true
-                })
-            });
-
-            if (response.ok) {
-                const data = await response.json();
-                if (data.status === 'stream' || data.status === 'redirect') {
-                    return {
-                        tweetId,
-                        mediaType: 'video',
-                        mediaUrls: [{ url: data.url, quality: 'best', bitrate: 0 }],
-                        thumbnail: null,
-                        source: 'cobalt'
-                    };
-                }
-                if (data.status === 'picker' && data.picker) {
-                    return {
-                        tweetId,
-                        mediaType: 'video',
-                        mediaUrls: data.picker.map((p, i) => ({
-                            url: p.url,
-                            quality: `option-${i + 1}`,
-                            bitrate: 0,
-                            thumb: p.thumb
-                        })),
-                        thumbnail: data.picker[0]?.thumb || null,
-                        source: 'cobalt'
-                    };
-                }
-            }
-        } catch (e) {
-            console.warn('Strategy 3 (Cobalt) failed:', e.message);
-            errors.push(`Cobalt: ${e.message}`);
-        }
-
-        // ── All strategies failed ───────────────────────────────
-        // Check if any strategy said "no video"
-        const noVideoMsg = errors.find(e => e.includes('does not contain') || e.includes('images but no'));
-        if (noVideoMsg) {
+            if (videos.length === 0) throw new Error('No video in syndication response');
             return {
                 tweetId,
-                mediaType: 'none',
+                mediaType: data.mediaDetails?.[0]?.type === 'animated_gif' ? 'gif' : 'video',
+                mediaUrls: videos,
+                thumbnail,
+                source: 'Twitter CDN'
+            };
+        })();
+
+        const strategy2 = (async () => {
+            const fxUrl = `https://api.fxtwitter.com/status/${tweetId}`;
+            const response = await fetchViaCorsProxy(fxUrl);
+            const data = JSON.parse(await response.text());
+            const tweet = data.tweet || data;
+            const media = tweet.media;
+            if (!media?.videos?.length) throw new Error('No video in fxtwitter response');
+            const videoList = media.videos.filter(v => v.url).map(v => ({
+                url: v.url,
+                quality: v.height ? `${v.height}p` : 'best',
+                bitrate: v.bitrate || 0
+            }));
+            if (videoList.length === 0) throw new Error('No valid video URLs');
+            return {
+                tweetId,
+                mediaType: media.videos[0]?.type === 'gif' ? 'gif' : 'video',
+                mediaUrls: videoList,
+                thumbnail: media.videos[0]?.thumbnail_url || media.photos?.[0]?.url || null,
+                source: 'fxtwitter'
+            };
+        })();
+
+        const strategy3 = (async () => {
+            const response = await fetch('https://api.cobalt.tools/api/json', {
+                method: 'POST',
+                headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url: tweetUrl, vCodec: 'h264', vQuality: 'max', isNoTTWatermark: true })
+            });
+            if (!response.ok) throw new Error(`Cobalt HTTP ${response.status}`);
+            const data = await response.json();
+            if (data.status === 'stream' || data.status === 'redirect') {
+                return {
+                    tweetId, mediaType: 'video',
+                    mediaUrls: [{ url: data.url, quality: 'best', bitrate: 0 }],
+                    thumbnail: null, source: 'cobalt'
+                };
+            }
+            if (data.status === 'picker' && data.picker) {
+                return {
+                    tweetId, mediaType: 'video',
+                    mediaUrls: data.picker.map((p, i) => ({ url: p.url, quality: `option-${i + 1}`, bitrate: 0, thumb: p.thumb })),
+                    thumbnail: data.picker[0]?.thumb || null, source: 'cobalt'
+                };
+            }
+            throw new Error('Cobalt returned no usable data');
+        })();
+
+        // ── Race all strategies ──────────────────────────────────
+        try {
+            return await Promise.any([strategy1, strategy2, strategy3]);
+        } catch (aggregateError) {
+            // All failed — check if it's a "no video" situation
+            const msgs = (aggregateError.errors || []).map(e => e.message);
+            const noVideo = msgs.some(m => m.includes('No video'));
+            return {
+                tweetId,
+                mediaType: noVideo ? 'none' : 'video',
                 mediaUrls: [],
                 thumbnail: null,
                 source: 'none',
-                error: noVideoMsg
+                error: noVideo
+                    ? 'This tweet does not contain a video or GIF.'
+                    : 'Could not extract media. The extraction services may be temporarily unavailable. Please try again in a moment.'
             };
         }
-
-        return {
-            tweetId,
-            mediaType: 'video',
-            mediaUrls: [],
-            thumbnail: null,
-            source: 'fallback',
-            error: 'Could not extract media. The extraction services may be temporarily unavailable. Please try again in a moment.'
-        };
     }
 
     /**
@@ -331,15 +263,14 @@
     }
 
     /**
-     * Converts an MP4 video to an animated GIF.
-     * First fetches the video via CORS proxy to avoid cross-origin restrictions,
-     * then captures frames on a canvas and encodes a real animated GIF.
+     * Converts an MP4 video to an animated GIF using gif.js (Web Worker-based).
+     * Fetches the video via CORS proxy first to avoid canvas tainting.
      * @param {string} videoUrl
      * @returns {Promise<Blob>}
      */
     async function convertVideoToGif(videoUrl) {
-        // Step 1: Fetch video as blob via CORS proxy to avoid canvas tainting
-        updateProgress(12);
+        // Step 1: Fetch video as blob via CORS proxy
+        updateProgress(10);
         let videoBlobUrl;
         try {
             const response = await fetchViaCorsProxy(videoUrl);
@@ -349,28 +280,26 @@
             throw new Error('Failed to download video for GIF conversion: ' + e.message);
         }
 
-        // Step 2: Load video from blob URL
-        updateProgress(18);
+        // Step 2: Load video element from blob URL
+        updateProgress(15);
         return new Promise((resolve, reject) => {
             const video = document.createElement('video');
             video.muted = true;
             video.playsInline = true;
             video.preload = 'auto';
 
-            const cleanup = () => {
-                URL.revokeObjectURL(videoBlobUrl);
-            };
+            const cleanup = () => URL.revokeObjectURL(videoBlobUrl);
 
             video.addEventListener('error', () => {
                 cleanup();
                 reject(new Error('Failed to load video for frame capture.'));
             });
 
-            video.addEventListener('loadeddata', () => {
+            video.addEventListener('loadeddata', async () => {
                 const canvas = document.createElement('canvas');
                 const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
-                // Scale down for reasonable GIF size
+                // Scale down for GIF
                 const maxDim = 320;
                 let w = video.videoWidth;
                 let h = video.videoHeight;
@@ -379,336 +308,93 @@
                     w = Math.round(w * scale);
                     h = Math.round(h * scale);
                 }
-                // GIF dimensions must be even for some decoders
                 w = w & ~1;
                 h = h & ~1;
                 canvas.width = w;
                 canvas.height = h;
 
                 const fps = 10;
-                const duration = Math.min(video.duration, 10); // Cap at 10s for GIF size
+                const duration = Math.min(video.duration, 8);
                 const frameCount = Math.max(1, Math.floor(duration * fps));
-                const frameDelay = Math.round(100 / fps); // in 1/100ths of a second
-                let captured = 0;
+                const frameDelay = Math.round(1000 / fps);
+
+                // Step 3: Capture frames
+                updateProgress(20);
                 const frames = [];
+                let captured = 0;
 
-                function captureFrame() {
-                    if (captured >= frameCount) {
-                        // Step 3: Encode animated GIF
-                        updateProgress(80);
-                        try {
-                            const gifBlob = encodeAnimatedGif(frames, w, h, frameDelay);
-                            cleanup();
-                            resolve(gifBlob);
-                        } catch (err) {
-                            cleanup();
-                            reject(new Error('GIF encoding failed: ' + err.message));
+                try {
+                    await new Promise((resolveCapture, rejectCapture) => {
+                        function captureFrame() {
+                            if (captured >= frameCount) {
+                                resolveCapture();
+                                return;
+                            }
+                            video.currentTime = Math.min(captured / fps, video.duration - 0.01);
                         }
-                        return;
-                    }
 
-                    const time = (captured / fps);
-                    video.currentTime = Math.min(time, video.duration - 0.01);
+                        video.addEventListener('seeked', function onSeeked() {
+                            ctx.drawImage(video, 0, 0, w, h);
+                            // Copy the canvas content for gif.js
+                            frames.push(ctx.getImageData(0, 0, w, h));
+                            captured++;
+                            updateProgress(20 + Math.round((captured / frameCount) * 40));
+                            captureFrame();
+                        });
+
+                        captureFrame();
+                    });
+                } catch (e) {
+                    cleanup();
+                    reject(new Error('Frame capture failed: ' + e.message));
+                    return;
                 }
 
-                video.addEventListener('seeked', function onSeeked() {
-                    ctx.drawImage(video, 0, 0, w, h);
-                    frames.push(ctx.getImageData(0, 0, w, h));
-                    captured++;
-                    updateProgress(20 + Math.round((captured / frameCount) * 58));
-                    // Use requestAnimationFrame to avoid blocking
-                    requestAnimationFrame(() => captureFrame());
-                });
+                // Step 4: Encode with gif.js
+                updateProgress(65);
 
-                captureFrame();
+                try {
+                    // Fetch the gif.worker.js from CDN and create a blob URL
+                    // (required because Web Workers can't load cross-origin scripts directly)
+                    const workerBlob = await fetch('https://cdn.jsdelivr.net/npm/gif.js@0.2.0/dist/gif.worker.js')
+                        .then(r => r.blob())
+                        .then(b => URL.createObjectURL(b));
+
+                    const gif = new GIF({
+                        workers: navigator.hardwareConcurrency || 2,
+                        quality: 10,
+                        width: w,
+                        height: h,
+                        workerScript: workerBlob,
+                        dither: false
+                    });
+
+                    // Add all captured frames
+                    for (const frame of frames) {
+                        gif.addFrame(frame, { delay: frameDelay, copy: true });
+                    }
+
+                    gif.on('progress', (p) => {
+                        updateProgress(65 + Math.round(p * 30));
+                    });
+
+                    gif.on('finished', (blob) => {
+                        URL.revokeObjectURL(workerBlob);
+                        cleanup();
+                        updateProgress(100);
+                        resolve(blob);
+                    });
+
+                    gif.render();
+                } catch (e) {
+                    cleanup();
+                    reject(new Error('gif.js encoding failed: ' + e.message));
+                }
             });
 
             video.src = videoBlobUrl;
             video.load();
         });
-    }
-
-    // ══════════════════════════════════════════════════════════
-    //  Inline Animated GIF Encoder (GIF89a with LZW)
-    //  No external dependencies required.
-    // ══════════════════════════════════════════════════════════
-
-    /**
-     * Quantizes an RGBA ImageData to a 256-color palette using median-cut.
-     * Returns { indexedPixels: Uint8Array, palette: [r,g,b,...] flat array of 256*3 }
-     */
-    function quantizeFrame(imageData) {
-        const pixels = imageData.data;
-        const numPixels = pixels.length / 4;
-
-        // Sample pixels for palette building (every Nth pixel for speed)
-        const sampleStep = Math.max(1, Math.floor(numPixels / 10000));
-        const samples = [];
-        for (let i = 0; i < numPixels; i += sampleStep) {
-            const off = i * 4;
-            samples.push([pixels[off], pixels[off + 1], pixels[off + 2]]);
-        }
-
-        // Median-cut quantization
-        const paletteColors = medianCut(samples, 256);
-
-        // Build flat palette (256 entries × 3 channels)
-        const palette = new Uint8Array(256 * 3);
-        for (let i = 0; i < paletteColors.length && i < 256; i++) {
-            palette[i * 3] = paletteColors[i][0];
-            palette[i * 3 + 1] = paletteColors[i][1];
-            palette[i * 3 + 2] = paletteColors[i][2];
-        }
-
-        // Map each pixel to nearest palette index
-        const indexedPixels = new Uint8Array(numPixels);
-        for (let i = 0; i < numPixels; i++) {
-            const off = i * 4;
-            const r = pixels[off], g = pixels[off + 1], b = pixels[off + 2];
-            indexedPixels[i] = findNearest(r, g, b, paletteColors);
-        }
-
-        return { indexedPixels, palette };
-    }
-
-    function medianCut(samples, maxColors) {
-        if (samples.length === 0) {
-            const result = [];
-            for (let i = 0; i < maxColors; i++) result.push([0, 0, 0]);
-            return result;
-        }
-
-        let buckets = [samples];
-
-        while (buckets.length < maxColors) {
-            // Find the bucket with the largest range in any channel
-            let bestIdx = 0;
-            let bestRange = -1;
-            let bestChannel = 0;
-
-            for (let bi = 0; bi < buckets.length; bi++) {
-                const b = buckets[bi];
-                if (b.length < 2) continue;
-                for (let ch = 0; ch < 3; ch++) {
-                    let lo = 255, hi = 0;
-                    for (const px of b) {
-                        if (px[ch] < lo) lo = px[ch];
-                        if (px[ch] > hi) hi = px[ch];
-                    }
-                    const range = hi - lo;
-                    if (range > bestRange) {
-                        bestRange = range;
-                        bestIdx = bi;
-                        bestChannel = ch;
-                    }
-                }
-            }
-
-            if (bestRange <= 0) break;
-
-            const bucket = buckets[bestIdx];
-            bucket.sort((a, b) => a[bestChannel] - b[bestChannel]);
-            const mid = bucket.length >> 1;
-            buckets.splice(bestIdx, 1, bucket.slice(0, mid), bucket.slice(mid));
-        }
-
-        // Average each bucket to get final colors
-        return buckets.map(bucket => {
-            if (bucket.length === 0) return [0, 0, 0];
-            let r = 0, g = 0, b = 0;
-            for (const px of bucket) { r += px[0]; g += px[1]; b += px[2]; }
-            const n = bucket.length;
-            return [Math.round(r / n), Math.round(g / n), Math.round(b / n)];
-        });
-    }
-
-    function findNearest(r, g, b, palette) {
-        let bestDist = Infinity;
-        let bestIdx = 0;
-        for (let i = 0; i < palette.length; i++) {
-            const dr = r - palette[i][0];
-            const dg = g - palette[i][1];
-            const db = b - palette[i][2];
-            const dist = dr * dr + dg * dg + db * db;
-            if (dist < bestDist) {
-                bestDist = dist;
-                bestIdx = i;
-                if (dist === 0) break;
-            }
-        }
-        return bestIdx;
-    }
-
-    /**
-     * LZW encoder for GIF. Compresses indexed pixel data.
-     */
-    function lzwEncode(indexedPixels, colorDepth) {
-        const minCodeSize = Math.max(2, colorDepth);
-        const clearCode = 1 << minCodeSize;
-        const eoiCode = clearCode + 1;
-
-        const output = [];
-        output.push(minCodeSize);
-
-        let codeSize = minCodeSize + 1;
-        let nextCode = eoiCode + 1;
-        const maxCodeLimit = 4096;
-
-        // Build initial dictionary
-        const dict = new Map();
-        for (let i = 0; i < clearCode; i++) {
-            dict.set(String(i), i);
-        }
-
-        // Sub-block buffer
-        let subBlock = [];
-        let blockBits = 0;
-        let blockBuf = 0;
-
-        function writeBits(code, size) {
-            blockBuf |= (code << blockBits);
-            blockBits += size;
-            while (blockBits >= 8) {
-                subBlock.push(blockBuf & 0xFF);
-                blockBuf >>= 8;
-                blockBits -= 8;
-                if (subBlock.length === 255) {
-                    output.push(subBlock.length);
-                    for (const b of subBlock) output.push(b);
-                    subBlock = [];
-                }
-            }
-        }
-
-        // Start with clear code
-        writeBits(clearCode, codeSize);
-
-        let current = String(indexedPixels[0]);
-
-        for (let i = 1; i < indexedPixels.length; i++) {
-            const next = String(indexedPixels[i]);
-            const combined = current + ',' + next;
-
-            if (dict.has(combined)) {
-                current = combined;
-            } else {
-                writeBits(dict.get(current), codeSize);
-
-                if (nextCode < maxCodeLimit) {
-                    dict.set(combined, nextCode++);
-                    if (nextCode > (1 << codeSize) && codeSize < 12) {
-                        codeSize++;
-                    }
-                } else {
-                    // Reset dictionary
-                    writeBits(clearCode, codeSize);
-                    dict.clear();
-                    for (let j = 0; j < clearCode; j++) {
-                        dict.set(String(j), j);
-                    }
-                    nextCode = eoiCode + 1;
-                    codeSize = minCodeSize + 1;
-                }
-
-                current = next;
-            }
-        }
-
-        // Write remaining
-        writeBits(dict.get(current), codeSize);
-        writeBits(eoiCode, codeSize);
-
-        // Flush remaining bits
-        if (blockBits > 0) {
-            subBlock.push(blockBuf & 0xFF);
-        }
-        if (subBlock.length > 0) {
-            output.push(subBlock.length);
-            for (const b of subBlock) output.push(b);
-        }
-
-        // Block terminator
-        output.push(0);
-
-        return new Uint8Array(output);
-    }
-
-    /**
-     * Encodes multiple frames into an animated GIF89a.
-     * @param {ImageData[]} frames - Array of canvas ImageData objects
-     * @param {number} width
-     * @param {number} height
-     * @param {number} delay - Frame delay in 1/100ths of a second
-     * @returns {Blob}
-     */
-    function encodeAnimatedGif(frames, width, height, delay) {
-        const parts = [];
-
-        function writeBytes(arr) {
-            parts.push(new Uint8Array(arr));
-        }
-
-        function writeString(s) {
-            const arr = [];
-            for (let i = 0; i < s.length; i++) arr.push(s.charCodeAt(i));
-            parts.push(new Uint8Array(arr));
-        }
-
-        function uint16LE(val) {
-            return [val & 0xFF, (val >> 8) & 0xFF];
-        }
-
-        // ── Header ──
-        writeString('GIF89a');
-
-        // ── Logical Screen Descriptor ──
-        const colorDepth = 8;
-        const colorTableSize = 256;
-        const gctFlag = 0; // No global color table; each frame has local
-        const packed = (gctFlag << 7) | ((colorDepth - 1) << 4) | (0); // no GCT
-        writeBytes([...uint16LE(width), ...uint16LE(height), packed, 0, 0]);
-
-        // ── Netscape Looping Extension (infinite loop) ──
-        writeBytes([0x21, 0xFF, 0x0B]); // Extension + App block
-        writeString('NETSCAPE2.0');
-        writeBytes([0x03, 0x01, ...uint16LE(0), 0x00]); // sub-block: loop count=0 (infinite)
-
-        // ── Frames ──
-        for (let fi = 0; fi < frames.length; fi++) {
-            const { indexedPixels, palette } = quantizeFrame(frames[fi]);
-
-            // Graphic Control Extension
-            writeBytes([
-                0x21, 0xF9, 0x04,       // Extension introducer, GCE label, block size
-                0x00,                     // No disposal, no transparency
-                ...uint16LE(delay),       // Delay
-                0x00,                     // No transparent color
-                0x00                      // Block terminator
-            ]);
-
-            // Image Descriptor (with local color table)
-            const lctPacked = 0x80 | (colorDepth - 1); // local color table, 256 entries
-            writeBytes([
-                0x2C,                     // Image separator
-                ...uint16LE(0),           // Left
-                ...uint16LE(0),           // Top
-                ...uint16LE(width),
-                ...uint16LE(height),
-                lctPacked
-            ]);
-
-            // Local Color Table (256 * RGB)
-            writeBytes(palette);
-
-            // LZW compressed data
-            const compressed = lzwEncode(indexedPixels, colorDepth);
-            writeBytes(compressed);
-        }
-
-        // ── Trailer ──
-        writeBytes([0x3B]);
-
-        return new Blob(parts, { type: 'image/gif' });
     }
 
     /**
