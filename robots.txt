@@ -1,0 +1,2 @@
+User-agent: *
+Sitemap: https://twitter-gif-downloader.toolifysite.com/sitemap.xml
