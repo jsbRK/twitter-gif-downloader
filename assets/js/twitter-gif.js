@@ -249,6 +249,14 @@
     }
 
     /**
+     * Ensures a URL uses the https:// protocol.
+     */
+    function ensureHttps(url) {
+        if (!url) return url;
+        return url.replace(/^http:\/\//i, 'https://');
+    }
+
+    /**
      * Extracts the best quality MP4 URL from media metadata.
      */
     function extractVideo(mediaUrls) {
@@ -259,15 +267,8 @@
             return (b.bitrate || 0) - (a.bitrate || 0);
         });
 
-        let url = sorted[0]?.url || mediaUrls[0]?.url || null;
-        if (url) {
-            if (url.startsWith('http://')) {
-                url = url.replace('http://', 'https://');
-            } else if (url.startsWith('//')) {
-                url = 'https:' + url;
-            }
-        }
-        return url;
+        const url = sorted[0]?.url || mediaUrls[0]?.url || null;
+        return ensureHttps(url);
     }
 
     /**
@@ -420,19 +421,28 @@
     }
 
     /**
-     * Downloads a file from a URL directly.
+     * Downloads a file from a URL directly via CORS proxy.
      */
     async function downloadFromUrl(url, filename) {
+        const safeUrl = ensureHttps(url);
         try {
-            const response = await fetch(url, { mode: 'cors' });
-            if (!response.ok) throw new Error('Download failed');
+            // Try direct fetch first
+            const response = await fetch(safeUrl, { mode: 'cors' });
+            if (!response.ok) throw new Error('Direct download failed');
             const blob = await response.blob();
             generateDownloadLink(blob, filename);
             return true;
         } catch {
-            // Fallback: open in new tab
-            window.open(url, '_blank');
-            return false;
+            // Fallback: fetch via CORS proxy
+            try {
+                const response = await fetchViaCorsProxy(safeUrl);
+                const blob = await response.blob();
+                generateDownloadLink(blob, filename);
+                return true;
+            } catch {
+                showToast('Download failed. Please try again.', 'error');
+                return false;
+            }
         }
     }
 
@@ -719,6 +729,7 @@
         // Download buttons
         document.getElementById('download-gif-btn')?.addEventListener('click', () => twitterGifController.downloadGif());
         document.getElementById('download-mp4-btn')?.addEventListener('click', () => twitterGifController.downloadMp4());
+
 
         // Copy & Share
         DOM.copyBtn?.addEventListener('click', () => twitterGifController.copyLink());
