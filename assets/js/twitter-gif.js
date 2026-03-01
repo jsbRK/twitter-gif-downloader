@@ -249,6 +249,14 @@
     }
 
     /**
+     * Ensures a URL uses the https:// protocol.
+     */
+    function ensureHttps(url) {
+        if (!url) return url;
+        return url.replace(/^http:\/\//i, 'https://');
+    }
+
+    /**
      * Extracts the best quality MP4 URL from media metadata.
      */
     function extractVideo(mediaUrls) {
@@ -259,7 +267,8 @@
             return (b.bitrate || 0) - (a.bitrate || 0);
         });
 
-        return sorted[0]?.url || mediaUrls[0]?.url || null;
+        const url = sorted[0]?.url || mediaUrls[0]?.url || null;
+        return ensureHttps(url);
     }
 
     /**
@@ -300,7 +309,7 @@
                 const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
                 // Scale down for GIF
-                const maxDim = 320;
+                const maxDim = 480;
                 let w = video.videoWidth;
                 let h = video.videoHeight;
                 if (w > maxDim || h > maxDim) {
@@ -640,22 +649,7 @@
             if (success) showToast('MP4 downloaded!', 'success');
         },
 
-        /**
-         * Download as WebM
-         */
-        async downloadWebm() {
-            if (!currentMediaData?.mp4Url) {
-                showToast('No media loaded. Paste a URL first!', 'error');
-                return;
-            }
 
-            showToast('Starting WebM download...', 'info');
-            const success = await downloadFromUrl(
-                currentMediaData.mp4Url,
-                `twitter-video-${currentMediaData.tweetId}.webm`
-            );
-            if (success) showToast('WebM downloaded!', 'success');
-        },
 
         /**
          * Copy media URL to clipboard
@@ -726,7 +720,7 @@
         // Download buttons
         document.getElementById('download-gif-btn')?.addEventListener('click', () => twitterGifController.downloadGif());
         document.getElementById('download-mp4-btn')?.addEventListener('click', () => twitterGifController.downloadMp4());
-        document.getElementById('download-webm-btn')?.addEventListener('click', () => twitterGifController.downloadWebm());
+
 
         // Copy & Share
         DOM.copyBtn?.addEventListener('click', () => twitterGifController.copyLink());
