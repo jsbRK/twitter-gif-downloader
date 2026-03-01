@@ -630,6 +630,18 @@
                 return;
             }
 
+            const btn = document.getElementById('download-gif-btn');
+            const originalHTML = btn?.innerHTML;
+            if (btn) {
+                btn.setAttribute('disabled', 'true');
+                btn.innerHTML = `
+                    <svg class="animate-spin w-5 h-5" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                    Converting...`;
+            }
+
             showToast('Converting to GIF... this may take a moment.', 'info');
             try {
                 const gifBlob = await convertVideoToGif(currentMediaData.mp4Url);
@@ -638,6 +650,11 @@
             } catch (err) {
                 showToast('GIF conversion failed. Try downloading as MP4 instead.', 'error');
                 console.error('GIF conversion error:', err);
+            } finally {
+                if (btn) {
+                    btn.removeAttribute('disabled');
+                    btn.innerHTML = originalHTML;
+                }
             }
         },
 
@@ -650,12 +667,31 @@
                 return;
             }
 
+            const btn = document.getElementById('download-mp4-btn');
+            const originalHTML = btn?.innerHTML;
+            if (btn) {
+                btn.setAttribute('disabled', 'true');
+                btn.innerHTML = `
+                    <svg class="animate-spin w-5 h-5" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                    Downloading...`;
+            }
+
             showToast('Starting MP4 download...', 'info');
-            const success = await downloadFromUrl(
-                currentMediaData.mp4Url,
-                `twitter-video-${currentMediaData.tweetId}.mp4`
-            );
-            if (success) showToast('MP4 downloaded!', 'success');
+            try {
+                const success = await downloadFromUrl(
+                    currentMediaData.mp4Url,
+                    `twitter-video-${currentMediaData.tweetId}.mp4`
+                );
+                if (success) showToast('MP4 downloaded!', 'success');
+            } finally {
+                if (btn) {
+                    btn.removeAttribute('disabled');
+                    btn.innerHTML = originalHTML;
+                }
+            }
         },
 
 
