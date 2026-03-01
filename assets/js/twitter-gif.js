@@ -249,14 +249,6 @@
     }
 
     /**
-     * Ensures a URL uses the https:// protocol.
-     */
-    function ensureHttps(url) {
-        if (!url) return url;
-        return url.replace(/^http:\/\//i, 'https://');
-    }
-
-    /**
      * Extracts the best quality MP4 URL from media metadata.
      */
     function extractVideo(mediaUrls) {
@@ -267,8 +259,15 @@
             return (b.bitrate || 0) - (a.bitrate || 0);
         });
 
-        const url = sorted[0]?.url || mediaUrls[0]?.url || null;
-        return ensureHttps(url);
+        let url = sorted[0]?.url || mediaUrls[0]?.url || null;
+        if (url) {
+            if (url.startsWith('http://')) {
+                url = url.replace('http://', 'https://');
+            } else if (url.startsWith('//')) {
+                url = 'https:' + url;
+            }
+        }
+        return url;
     }
 
     /**
@@ -720,7 +719,6 @@
         // Download buttons
         document.getElementById('download-gif-btn')?.addEventListener('click', () => twitterGifController.downloadGif());
         document.getElementById('download-mp4-btn')?.addEventListener('click', () => twitterGifController.downloadMp4());
-
 
         // Copy & Share
         DOM.copyBtn?.addEventListener('click', () => twitterGifController.copyLink());
